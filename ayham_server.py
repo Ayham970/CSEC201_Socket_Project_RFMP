@@ -1,13 +1,14 @@
 # ayham_server.py
-# Person 1: September 29 checkpoint
-# Requires Person 3's packets.py module.
+# RFMP Server - Person 1
+# Day 1 (Sep 29): listening server, one thread per client,
+# separate session record, unencrypted SS -> CC, and End.
+# Uses Person 3's packets.py for framing and Base64.
 
 import socket
 import threading
-from pathlib import Path
+import os
 
-from packets import ProtocolError, encode_field, receive_packet, send_packet
-
+from packets import send_packet, receive_packet, encode_field, ProtocolError
 
 HOST = "127.0.0.1"
 PORT = 5050
@@ -15,129 +16,121 @@ PORT = 5050
 PROTOCOL_NAME = "RFMP"
 PROTOCOL_VERSION = "v1.0"
 
-SERVER_ROOT = Path(__file__).resolve().parent / "server_storage"
+# server_storage/ is next to this script (protocol.md section 1)
+SERVER_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "server_storage")
+
+# Error codes (protocol.md section 8.2)
+# 1 = protocol error
+# 2 = file or path error
+# 3 = command error
+# 4 = encryption error
 
 
-def send_error(connection, code, description):
-    """Send an EE packet if the client is still connected."""
-    try:
-        send_packet(
-            connection,
-            "EE",
-            [str(code), encode_field(description.encode("utf-8"))],
-        )
-    except OSError:
-        pass
+def send_error(clientsocket, code, description):
+    # EE packet: (EE,code,B64(description))
+    send_packet(clientsocket, "EE", [str(code), encode_field(description.encode("utf-8"))])
 
 
-def perform_server_setup(connection, session):
-    """Receive SS, validate it, and send CC."""
-    packet_type, fields = receive_packet(connection)
+def handle_client(clientsocket, addr):
+    print("Got a connection from %s" % str(addr))
 
-    if packet_type != "SS" or len(fields) != 3:
-        raise ProtocolError("Expected SS with three fields.")
-
-    protocol_name, version, secure = fields
-
-    if protocol_name != PROTOCOL_NAME:
-        raise ProtocolError("Unsupported protocol name.")
-
-    if version != PROTOCOL_VERSION:
-        raise ProtocolError("Unsupported protocol version.")
-
-    if secure not in ("0", "1"):
-        raise ProtocolError("Security flag must be 0 or 1.")
-
-    if secure == "1":
-        send_error(connection, 4, "Encrypted setup is not implemented yet.")
-        return False
-
-    send_packet(connection, "CC", [])
-    session["state"] = "READY"
-
-    return True
-
-
-def handle_client(connection, address):
-    """Manage one client connection and its own session."""
-
-    # Every call creates a separate dictionary for this client.
+    # Separate session record for this client only
     session = {
         "state": "WAIT_START",
         "current_directory": SERVER_ROOT,
-        "security_mode": "NONE",
+        "mode": "NONE",
         "session_key": b"",
         "username": None,
         "client_public_key": None,
         "pending_write_path": None,
     }
 
-    print(f"Client connected: {address}")
-
     try:
-        if not perform_server_setup(connection, session):
+        # ---------- SETUP PHASE ----------
+        # Expected: (SS,RFMP,v1.0,0)
+        packet_type, fields = receive_packet(clientsocket)
+
+        if packet_type != "SS" or len(fields) != 3:
+            send_error(clientsocket, 1, "Expected SS packet")
             return
 
-        print(f"Handshake completed: {address}")
+        protocol_name = fields[0]
+        version = fields[1]
+        secure = fields[2]
 
+        if protocol_name != PROTOCOL_NAME or version != PROTOCOL_VERSION:
+            send_error(clientsocket, 1, "Wrong protocol name or version")
+            return
+
+        if secure == "1":
+            # Encrypted setup is added on Day 3
+            send_error(clientsocket, 4, "Encrypted setup not implemented yet")
+            return
+
+        if secure != "0":
+            send_error(clientsocket, 1, "Security flag must be 0 or 1")
+            return
+
+        # Not secured: reply (CC)
+        send_packet(clientsocket, "CC", [])
+        session["state"] = "READY"
+        print("Handshake done with %s" % str(addr))
+
+        # ---------- OPERATION PHASE ----------
         while session["state"] == "READY":
-            packet_type, fields = receive_packet(connection)
+            packet_type, fields = receive_packet(clientsocket)
 
+            # ---------- CLOSING PHASE ----------
             if packet_type == "End":
-                send_packet(connection, "SC", [encode_field(b"BYE")])
+                # (SC,B64("BYE")) = (SC,QllF)
+                send_packet(clientsocket, "SC", [encode_field(b"BYE")])
                 break
 
-            if packet_type == "CM":
-                send_error(connection, 3, "Commands are not implemented yet.")
-            else:
-                send_error(connection, 1, "Expected CM or End after setup.")
+            elif packet_type == "CM":
+                # Commands are added on Day 2
+                send_error(clientsocket, 3, "Commands not implemented yet")
 
-    except ProtocolError as error:
-        send_error(connection, 1, str(error))
+            else:
+                send_error(clientsocket, 1, "Expected CM or End")
+
+    except ProtocolError as e:
+        # Bad framing or malformed packet: send EE if possible, then close
+        try:
+            send_error(clientsocket, 1, str(e))
+        except OSError:
+            pass
 
     except EOFError:
-        print(f"Client disconnected unexpectedly: {address}")
+        print("Client disconnected without End: %s" % str(addr))
 
-    except OSError as error:
-        print(f"Connection error for {address}: {error}")
+    except OSError as e:
+        print("Connection error with %s: %s" % (str(addr), e))
 
     finally:
         session["state"] = "CLOSED"
         session["pending_write_path"] = None
-        connection.close()
-
-        print(f"Connection closed: {address}")
-
-
-def start_server():
-    """Listen for connections and start one thread per client."""
-    SERVER_ROOT.mkdir(parents=True, exist_ok=True)
-
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
-        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-
-        server.bind((HOST, PORT))
-        server.listen()
-
-        print(f"RFMP server listening on {HOST}:{PORT}")
-        print("Press Ctrl+C to stop.")
-
-        while True:
-            connection, address = server.accept()
-
-            client_thread = threading.Thread(
-                target=handle_client,
-                args=(connection, address),
-                daemon=True,
-            )
-
-            client_thread.start()
+        clientsocket.close()
+        print("Connection closed: %s" % str(addr))
 
 
-if __name__ == "__main__":
-    try:
-        start_server()
-    except KeyboardInterrupt:
-        print("\nServer stopped.")
-    except OSError as error:
-        raise SystemExit(f"Could not run the server: {error}")
+# Make sure the storage folder exists
+if not os.path.exists(SERVER_ROOT):
+    os.mkdir(SERVER_ROOT)
+
+# create a socket object
+serversocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+# bind to the port
+serversocket.bind((HOST, PORT))
+
+# queue up to 5 requests
+serversocket.listen(5)
+print("RFMP server listening on %s:%d" % (HOST, PORT))
+
+while True:
+    # establish a connection
+    clientsocket, addr = serversocket.accept()
+
+    # new thread for each client
+    thread1 = threading.Thread(target=handle_client, args=(clientsocket, addr))
+    thread1.start()
