@@ -1,0 +1,7 @@
+# The current packet framing, Base64 helpers, and NONE mode
+# use only Python's built-in standard library.
+#
+# No third-party packages are required for this milestone.
+#
+# The cryptography package must be added later when the
+# RSA and AES encryption features are implemented.
