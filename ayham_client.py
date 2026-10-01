@@ -1,8 +1,9 @@
-
 # ayham_client.py - RFMP Python client
+# Uses the team's packets.py and crypto_utils.py (see docs/protocol.md).
 
 import socket
 from packets import send_packet, receive_packet, encode_field, decode_field
+from crypto_utils import generate_session_key, encrypt_payload, decrypt_payload
 
 host = "127.0.0.1"
 port = 5050
@@ -38,40 +39,23 @@ s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 s.settimeout(30)
 
 try:
-    mode = input("Choose NONE, AES or CAESAR: ").strip().upper()
-    while mode not in ("NONE", "AES", "CAESAR"):
-        mode = input("Please enter NONE, AES or CAESAR: ").strip().upper()
+    # Press Enter to connect to a server running on this computer.
+    server_ip = input("Server IP [127.0.0.1]: ").strip()
+    if server_ip != "":
+        host = server_ip
 
-    key = b""
-    if mode != "NONE":
-        from crypto_utils import generate_rsa_keypair, serialize_public_key
-        from crypto_utils import load_public_key, generate_session_key, encrypt_session_key
-        from crypto_utils import encrypt_payload, decrypt_payload
-
-        username = input("Username: ")
-        private_key, public_key = generate_rsa_keypair()
-        key = generate_session_key(mode)
-
+    # The current crypto_utils.py supports NONE mode only.
+    # No encryption is used, so generate_session_key returns b"".
+    mode = "NONE"
+    key = generate_session_key(mode)
     s.connect((host, port))
 
-    # Setup phase: start the session and wait for the server.
-    if mode == "NONE":
-        send_packet(s, "SS", ["RFMP", "v1.0", "0"])
-        if get_reply("CC", 0) is None:
-            raise ValueError("Connection refused")
-    else:
-        send_packet(s, "SS", ["RFMP", "v1.0", "1"])
-        fields = get_reply("CC", 1)
-        if fields is None:
-            raise ValueError("Encrypted connection refused")
-        server_key = load_public_key(decode_field(fields[0]))
-        wrapped_key = encrypt_session_key(server_key, key)
-        credentials = encode_field(username.encode("utf-8")) + ":" + encode_field(serialize_public_key(public_key))
-        send_packet(s, "EC", [mode, encode_field(wrapped_key), credentials])
-        if not get_message("SETUP_COMPLETE"):
-            raise ValueError("Encryption setup failed")
+    # Setup phase: start an unencrypted session.
+    send_packet(s, "SS", ["RFMP", "v1.0", "0"])
+    if get_reply("CC", 0) is None:
+        raise ValueError("Connection refused")
 
-    print("Connected to the server.")
+    print("Connected to " + host + " using NONE mode (no encryption).")
 
     # Operation phase: handle one request at a time.
     while True:
@@ -83,6 +67,8 @@ try:
 
         if choice == "1":
             print("Commands: mkdir, cd, rmdir, rd, del, ren, ls, pwd, whoami, hostname, date")
+            print("Examples: mkdir test, cd test, ren old new")
+            print("Use names without spaces in these commands.")
             command = input("Command: ")
             send_packet(s, "CM", ["prompt", encode_field(command.encode("utf-8"))])
             fields = get_reply("SC", 1)
@@ -97,8 +83,7 @@ try:
             if fields is None:
                 continue
             data = decode_field(fields[0])
-            if mode != "NONE":
-                data = decrypt_payload(data, mode, key)
+            data = decrypt_payload(data, mode, key)
             if len(data) > max_file_size:
                 raise ValueError("Downloaded file exceeds 1 MiB")
             data.decode("utf-8")  # Check that this is a UTF-8 text file.
@@ -125,8 +110,7 @@ try:
             except (OSError, ValueError) as error:
                 print("Cannot upload file:", error)
                 continue
-            if mode != "NONE":
-                data = encrypt_payload(data, mode, key)
+            data = encrypt_payload(data, mode, key)
             payload = encode_field(data)
             send_packet(s, "CM", ["openWrite", encode_field(filename.encode("utf-8"))])
             if not get_message("READY"):
