@@ -19,7 +19,7 @@ from crypto_utils import encrypt_payload, decrypt_payload
 from crypto_utils import generate_rsa_keypair, serialize_public_key
 from crypto_utils import load_public_key, decrypt_session_key
 
-HOST = "127.0.0.1"
+HOST = "0.0.0.0"
 PORT = 5050
 
 PROTOCOL_NAME = "RFMP"
