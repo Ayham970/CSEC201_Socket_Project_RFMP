@@ -57,6 +57,14 @@ Base64 converts variable binary or text data into safe ASCII characters so comma
 
 In `NONE` mode, no encryption key is needed. The session key is `b""`, and encryption and decryption return the original bytes unchanged.
 
+## Encryption Helper Update
+
+I used ChatGPT to help implement and test RSA session-key exchange, AES-GCM payload encryption, and Caesar payload encryption.
+
+The implementation includes 2048-bit RSA keys, DER public-key serialization, RSA-OAEP with SHA-256, 32-byte AES session keys, fresh 12-byte AES-GCM nonces, and Caesar shift keys from 1 through 25.
+
+Local tests confirmed successful RSA session-key recovery and successful encryption/decryption of both empty and multiline content using NONE, AES-GCM, and Caesar modes.
+
 
 - **RSA and session key.** RSA is slow and only suitable for small data, so it is used only to send the AES or Caesar key safely. The client encrypts the key with the server public key, and only the server private key can decrypt it. The faster AES or Caesar cipher then encrypts file contents.
 - **Error codes.** 1 = protocol error, 2 = file or path error, 3 = command error, 4 = encryption error.
