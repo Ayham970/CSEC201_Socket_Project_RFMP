@@ -4,14 +4,20 @@
 #        unencrypted SS -> CC, and End.
 # Sep 30: openRead, openWrite, and the prompt commands mkdir, cd, ls, pwd.
 #        Each client keeps its own working directory.
+# Oct 1:  secured setup (RSA + AES/CAESAR session key), encrypted file
+#        transfers, and rmdir/rd, del, ren, whoami, hostname, date.
 # Uses Person 3's packets.py (framing + Base64) and crypto_utils.py.
 
 import socket
 import threading
 import os
+import subprocess
+import time
 
 from packets import send_packet, receive_packet, encode_field, decode_field, ProtocolError
 from crypto_utils import encrypt_payload, decrypt_payload
+from crypto_utils import generate_rsa_keypair, serialize_public_key
+from crypto_utils import load_public_key, decrypt_session_key
 
 HOST = "127.0.0.1"
 PORT = 5050
@@ -116,12 +122,98 @@ def cmd_pwd(session, args):
     return True, "/" + relative.replace(os.sep, "/")
 
 
+def cmd_rmdir(session, args):
+    # rmdir and rd both use this. Only empty folders can be removed.
+    if len(args) != 1:
+        return False, "Usage: rmdir <folder>"
+    path = resolve_path(session, args[0])
+    if path is None:
+        return False, "Path is outside the server folder"
+    if path == SERVER_ROOT:
+        return False, "Cannot remove the server root folder"
+    if not os.path.isdir(path):
+        return False, "Folder not found: " + args[0]
+    if len(os.listdir(path)) != 0:
+        return False, "Folder is not empty: " + args[0]
+    os.rmdir(path)
+    return True, "Folder removed: " + args[0]
+
+
+def cmd_del(session, args):
+    # Delete one file (not a folder)
+    if len(args) != 1:
+        return False, "Usage: del <file>"
+    path = resolve_path(session, args[0])
+    if path is None:
+        return False, "Path is outside the server folder"
+    if not os.path.isfile(path):
+        return False, "File not found: " + args[0]
+    os.remove(path)
+    return True, "File deleted: " + args[0]
+
+
+def cmd_ren(session, args):
+    # Rename a folder: ren old_name new_name
+    if len(args) != 2:
+        return False, "Usage: ren <old_name> <new_name>"
+    old_path = resolve_path(session, args[0])
+    new_path = resolve_path(session, args[1])
+    if old_path is None or new_path is None:
+        return False, "Path is outside the server folder"
+    if old_path == SERVER_ROOT:
+        return False, "Cannot rename the server root folder"
+    if not os.path.isdir(old_path):
+        return False, "Folder not found: " + args[0]
+    if os.path.exists(new_path):
+        return False, "Name already exists: " + args[1]
+    os.rename(old_path, new_path)
+    return True, "Renamed " + args[0] + " to " + args[1]
+
+
+def run_system_command(command_name):
+    # Run a system command with subprocess.run() and return its output.
+    # cwd= is set to the server root so it never depends on os.chdir().
+    result = subprocess.run([command_name], capture_output=True, text=True,
+                            cwd=SERVER_ROOT, timeout=5)
+    if result.returncode != 0:
+        return False, "Command failed: " + command_name + " " + result.stderr.strip()
+    return True, result.stdout.strip()
+
+
+def cmd_whoami(session, args):
+    # Username the server program is running as
+    if len(args) != 0:
+        return False, "Usage: whoami"
+    return run_system_command("whoami")
+
+
+def cmd_hostname(session, args):
+    # Name of the server computer
+    if len(args) != 0:
+        return False, "Usage: hostname"
+    return run_system_command("hostname")
+
+
+def cmd_date(session, args):
+    # Server date and time, e.g. "Thu Oct  1 10:15:00 2026"
+    if len(args) != 0:
+        return False, "Usage: date"
+    return True, time.ctime()
+
+
 # Table of supported prompt commands
 COMMANDS = {
     "mkdir": cmd_mkdir,
     "cd": cmd_cd,
     "ls": cmd_ls,
     "pwd": cmd_pwd,
+    "rmdir": cmd_rmdir,
+    "rd": cmd_rmdir,
+    "del": cmd_del,
+    "ren": cmd_ren,
+    "whoami": cmd_whoami,
+    "hostname": cmd_hostname,
+    "date": cmd_date,
 }
 
 
@@ -146,6 +238,9 @@ def handle_prompt(clientsocket, session, command_field):
 
     try:
         ok, output = COMMANDS[name](session, args)
+    except subprocess.TimeoutExpired:
+        send_error(clientsocket, 3, "Command timed out: " + name)
+        return
     except FileExistsError:
         send_error(clientsocket, 2, "Already exists: " + args[0])
         return
@@ -161,8 +256,8 @@ def handle_prompt(clientsocket, session, command_field):
 
     if ok:
         send_success(clientsocket, output)
-    elif output.startswith("Usage"):
-        send_error(clientsocket, 3, output)       # wrong number of arguments
+    elif output.startswith("Usage") or output.startswith("Command failed"):
+        send_error(clientsocket, 3, output)       # wrong arguments or command failed
     else:
         send_error(clientsocket, 2, output)       # bad path
 
@@ -243,8 +338,10 @@ def handle_write_data(clientsocket, session, payload_field):
 
     try:
         data = decrypt_payload(payload, session["mode"], session["session_key"])
-    except Exception as e:
-        send_error(clientsocket, 4, "Decryption failed: " + str(e))
+    except Exception:
+        # Wrong key, altered AES data, or a payload that is too short.
+        # The file is NOT written.
+        send_error(clientsocket, 4, "Decryption failed: wrong key or altered data")
         return
 
     if len(data) > MAX_FILE_SIZE:
@@ -273,6 +370,85 @@ def handle_write_data(clientsocket, session, payload_field):
         return
 
     send_success(clientsocket, "SAVED")
+
+
+# ---------- SECURED SETUP ----------
+def secured_setup(clientsocket, session):
+    # Runs after (SS,RFMP,v1.0,1).
+    # Returns True when the session is READY, False if the connection
+    # should close (an EE or the BYE reply has already been sent).
+
+    # 1. Make a new RSA key pair for this client only and send the
+    #    public key: (CC,B64(public key))
+    private_key, public_key = generate_rsa_keypair()
+    send_packet(clientsocket, "CC", [encode_field(serialize_public_key(public_key))])
+    session["state"] = "WAIT_EC"
+
+    # 2. Wait for (EC,algorithm,B64(encrypted session key),B64(user):B64(client key))
+    packet_type, fields = receive_packet(clientsocket)
+
+    if packet_type == "End":
+        send_success(clientsocket, "BYE")
+        return False
+
+    if packet_type != "EC":
+        send_error(clientsocket, 1, "Expected EC packet")
+        return False
+
+    algorithm = fields[0]
+    wrapped_key_field = fields[1]
+    credentials = fields[2]
+
+    if algorithm != "AES" and algorithm != "CAESAR":
+        send_error(clientsocket, 4, "Unsupported algorithm: " + algorithm)
+        return False
+
+    # The credentials field is "username:client_public_key" (both Base64)
+    parts = credentials.split(":")
+    if len(parts) != 2:
+        send_error(clientsocket, 1, "Credentials must be username:public_key")
+        return False
+
+    try:
+        wrapped_key = decode_field(wrapped_key_field)
+        username = decode_field(parts[0]).decode("utf-8")
+        client_key_bytes = decode_field(parts[1])
+    except (ProtocolError, UnicodeDecodeError):
+        send_error(clientsocket, 1, "Invalid encoding in EC packet")
+        return False
+
+    # 3. Load the client's public key and decrypt the session key
+    #    with OUR private key
+    try:
+        client_public_key = load_public_key(client_key_bytes)
+    except Exception:
+        send_error(clientsocket, 4, "Invalid client public key")
+        return False
+
+    try:
+        session_key = decrypt_session_key(private_key, wrapped_key)
+    except Exception:
+        send_error(clientsocket, 4, "Could not decrypt the session key")
+        return False
+
+    # 4. Check the key is the right size for the algorithm
+    #    AES: 32 bytes. CAESAR: 1 byte with a shift from 1 to 25.
+    if algorithm == "AES" and len(session_key) != 32:
+        send_error(clientsocket, 4, "AES session key must be 32 bytes")
+        return False
+    if algorithm == "CAESAR":
+        if len(session_key) != 1 or session_key[0] < 1 or session_key[0] > 25:
+            send_error(clientsocket, 4, "Caesar key must be one byte from 1 to 25")
+            return False
+
+    # 5. Save everything in THIS client's session and confirm
+    session["mode"] = algorithm
+    session["session_key"] = session_key
+    session["username"] = username
+    session["client_public_key"] = client_public_key
+    session["state"] = "READY"
+    send_success(clientsocket, "SETUP_COMPLETE")
+    return True
 
 
 def handle_client(clientsocket, addr):
@@ -307,18 +483,21 @@ def handle_client(clientsocket, addr):
             return
 
         if secure == "1":
-            # Encrypted setup is added on Day 3
-            send_error(clientsocket, 4, "Encrypted setup not implemented yet")
-            return
+            # Secured: (CC,pubkey) -> (EC,...) -> (SC,SETUP_COMPLETE)
+            if not secured_setup(clientsocket, session):
+                return
+            print("Secured handshake done with %s (%s, user %s)"
+                  % (str(addr), session["mode"], session["username"]))
 
-        if secure != "0":
+        elif secure == "0":
+            # Not secured: reply (CC)
+            send_packet(clientsocket, "CC", [])
+            session["state"] = "READY"
+            print("Handshake done with %s" % str(addr))
+
+        else:
             send_error(clientsocket, 1, "Security flag must be 0 or 1")
             return
-
-        # Not secured: reply (CC)
-        send_packet(clientsocket, "CC", [])
-        session["state"] = "READY"
-        print("Handshake done with %s" % str(addr))
 
         # ---------- OPERATION PHASE ----------
         while session["state"] in ("READY", "WAIT_DATA"):
