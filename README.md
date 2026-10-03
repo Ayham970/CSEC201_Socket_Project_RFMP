@@ -9,7 +9,7 @@ Work split:
   
   packets.py -> Elie
   
-  crypto_utils.py -> Elie
+  crypto_utils.py -> ELie
   
   ayham_client.c -> Khaled
 
@@ -67,7 +67,17 @@ Server errors are shown as `Server error <code>: <description>`.
 
 ### 4. Run the C client
 
+On macOS or Linux, compile it with:
 
+```bash
+gcc ayham_client.c -o ayham_client
+```
+
+Run the compiled client with:
+
+```bash
+./ayham_client
+```
 
 Enter the server IPv4 address when requested. Use `127.0.0.1` when the server is running on the same computer.
 
