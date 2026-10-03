@@ -1,136 +1,167 @@
-# ayham_client.py - RFMP Python client
-# Uses the team's packets.py and crypto_utils.py (see docs/protocol.md).
+# ayham_client.py
+# RFMP Python Client (Remote File Management Protocol)
+# Uses packets.py (packet framing + Base64) and crypto_utils.py (RSA, AES, Caesar).
 
 import socket
+
 from packets import send_packet, receive_packet, encode_field, decode_field
-from crypto_utils import generate_session_key, encrypt_payload, decrypt_payload
+from crypto_utils import generate_session_key, generate_rsa_keypair, serialize_public_key
+from crypto_utils import load_public_key, encrypt_session_key, encrypt_payload, decrypt_payload
 
-host = "127.0.0.1"
-port = 5050
-max_file_size = 1048576  # 1 MiB
+PORT = 5050
 
 
-# Receive a reply and display any error sent by the server.
-def get_reply(expected_type, field_count):
+def get_reply(expected_type):
+    # Receive the server's reply and check it.
+    # If the server sent (EE,code,description), show the error and return None.
     packet_type, fields = receive_packet(s)
+
     if packet_type == "EE":
-        if len(fields) != 2 or fields[0] not in ("1", "2", "3", "4"):
-            raise ValueError("Invalid error packet")
-        print("Server error " + fields[0] + ": " + decode_field(fields[1]).decode("utf-8"))
+        print("Server error " + fields[0] + ": " + decode_field(fields[1]).decode())
         return None
-    if packet_type != expected_type or len(fields) != field_count:
-        raise ValueError("Unexpected server reply")
+
+    if packet_type != expected_type:
+        raise ValueError("Unexpected reply from server: " + packet_type)
+
     return fields
 
 
-# Check that the server has finished the current step.
-def get_message(expected_message):
-    fields = get_reply("SC", 1)
+def get_message():
+    # Receive (SC,message) and return the message text, or None on (EE,...)
+    fields = get_reply("SC")
     if fields is None:
-        return False
-    message = decode_field(fields[0]).decode("utf-8")
-    if message != expected_message:
-        raise ValueError("Expected " + expected_message + ", received " + message)
-    return True
+        return None
+    return decode_field(fields[0]).decode()
 
 
-# Create a TCP socket, like the example from class.
+# create a socket object
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.settimeout(30)
 
 try:
-    # Press Enter to connect to a server running on this computer.
-    server_ip = input("Server IP [127.0.0.1]: ").strip()
-    if server_ip != "":
-        host = server_ip
+    host = input("Server IP [127.0.0.1]: ").strip()
+    if host == "":
+        host = "127.0.0.1"
 
-    # The current crypto_utils.py supports NONE mode only.
-    # No encryption is used, so generate_session_key returns b"".
-    mode = "NONE"
+    mode = input("Choose NONE, AES or CAESAR: ").strip().upper()
+    while mode not in ("NONE", "AES", "CAESAR"):
+        mode = input("Please enter NONE, AES or CAESAR: ").strip().upper()
+
+    # Session key: NONE = empty, AES = 32 random bytes, CAESAR = shift 1-25
     key = generate_session_key(mode)
-    s.connect((host, port))
 
-    # Setup phase: start an unencrypted session.
-    send_packet(s, "SS", ["RFMP", "v1.0", "0"])
-    if get_reply("CC", 0) is None:
-        raise ValueError("Connection refused")
+    # connect to the server
+    s.connect((host, PORT))
 
-    print("Connected to " + host + " using NONE mode (no encryption).")
+    # ---------- SETUP PHASE ----------
+    if mode == "NONE":
+        # (SS,RFMP,v1.0,0) -> (CC)
+        send_packet(s, "SS", ["RFMP", "v1.0", "0"])
+        if get_reply("CC") is None:
+            raise ValueError("Server refused the connection")
 
-    # Operation phase: handle one request at a time.
+    else:
+        username = input("Username: ").strip()
+
+        # The client makes its own RSA key pair
+        private_key, public_key = generate_rsa_keypair()
+
+        # (SS,RFMP,v1.0,1) -> (CC,server_public_key)
+        send_packet(s, "SS", ["RFMP", "v1.0", "1"])
+        fields = get_reply("CC")
+        if fields is None:
+            raise ValueError("Server refused the secured connection")
+
+        # Encrypt the session key with the server PUBLIC key
+        server_public_key = load_public_key(decode_field(fields[0]))
+        encrypted_key = encrypt_session_key(server_public_key, key)
+
+        # (EC,algorithm,encrypted_session_key,username:client_public_key)
+        credentials = encode_field(username.encode()) + ":" + encode_field(serialize_public_key(public_key))
+        send_packet(s, "EC", [mode, encode_field(encrypted_key), credentials])
+
+        if get_message() != "SETUP_COMPLETE":
+            raise ValueError("Encryption setup failed")
+
+    print("Connected to " + host + " using " + mode + " mode.")
+
+    # ---------- OPERATION PHASE ----------
     while True:
-        print("\n1. Run a command\n2. Read a file\n3. Write a file\n4. End")
-        try:
-            choice = input("Choose 1-4: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            choice = "4"
+        print("\n1. Run a command")
+        print("2. Read a file (openRead)")
+        print("3. Write a file (openWrite)")
+        print("4. End")
+        choice = input("Choose 1-4: ").strip()
 
         if choice == "1":
+            # (CM,prompt,command) -> (SC,output) or (EE,...)
             print("Commands: mkdir, cd, rmdir, rd, del, ren, ls, pwd, whoami, hostname, date")
-            print("Examples: mkdir test, cd test, ren old new")
-            print("Use names without spaces in these commands.")
             command = input("Command: ")
-            send_packet(s, "CM", ["prompt", encode_field(command.encode("utf-8"))])
-            fields = get_reply("SC", 1)
-            if fields is not None:
-                print(decode_field(fields[0]).decode("utf-8"))
+            send_packet(s, "CM", ["prompt", encode_field(command.encode())])
+            output = get_message()
+            if output is not None:
+                print(output)
 
         elif choice == "2":
-            filename = input("Remote filename (relative path): ")
-            local_name = input("Save locally as (existing file will be replaced): ")
-            send_packet(s, "CM", ["openRead", encode_field(filename.encode("utf-8"))])
-            fields = get_reply("DP", 1)
+            # (CM,openRead,filename) -> (DP,data) -> (SC,READ_COMPLETE)
+            filename = input("Server filename: ")
+            send_packet(s, "CM", ["openRead", encode_field(filename.encode())])
+
+            fields = get_reply("DP")
             if fields is None:
                 continue
-            data = decode_field(fields[0])
-            data = decrypt_payload(data, mode, key)
-            if len(data) > max_file_size:
-                raise ValueError("Downloaded file exceeds 1 MiB")
-            data.decode("utf-8")  # Check that this is a UTF-8 text file.
-            if not get_message("READ_COMPLETE"):
-                raise ValueError("Download did not finish correctly")
-            # Save only after the data and completion reply are valid.
-            try:
-                with open(local_name, "wb") as file:
-                    file.write(data)
-                print("File downloaded.")
-            except OSError as error:
-                print("Cannot save local file:", error)
+
+            # Decrypt with the session key (NONE returns the same data)
+            data = decrypt_payload(decode_field(fields[0]), mode, key)
+            get_message()  # READ_COMPLETE
+
+            print("----- " + filename + " -----")
+            print(data.decode())
+
+            save_name = input("Save a copy as (press Enter to skip): ").strip()
+            if save_name != "":
+                file = open(save_name, "wb")
+                file.write(data)
+                file.close()
+                print("Saved to " + save_name)
 
         elif choice == "3":
-            local_name = input("Local filename: ")
-            filename = input("Remote filename (existing file will be replaced): ")
-            # Read and check the local file before asking the server to write.
+            # (CM,openWrite,filename) -> (SC,READY) -> (DP,data) -> (SC,SAVED)
+            local_name = input("Local file to send: ")
             try:
-                with open(local_name, "rb") as file:
-                    data = file.read(max_file_size + 1)
-                if len(data) > max_file_size:
-                    raise ValueError("File exceeds 1 MiB")
-                data.decode("utf-8")
-            except (OSError, ValueError) as error:
-                print("Cannot upload file:", error)
+                file = open(local_name, "rb")
+                data = file.read()
+                file.close()
+            except OSError:
+                print("Local file not found: " + local_name)
                 continue
+
+            filename = input("Save on server as: ")
+            send_packet(s, "CM", ["openWrite", encode_field(filename.encode())])
+            if get_message() != "READY":
+                continue
+
+            # Encrypt with the session key before sending
             data = encrypt_payload(data, mode, key)
-            payload = encode_field(data)
-            send_packet(s, "CM", ["openWrite", encode_field(filename.encode("utf-8"))])
-            if not get_message("READY"):
-                continue
-            send_packet(s, "DP", [payload])
-            if get_message("SAVED"):
+            send_packet(s, "DP", [encode_field(data)])
+
+            if get_message() == "SAVED":
                 print("File uploaded.")
 
         elif choice == "4":
-            # Closing phase: tell the server, receive BYE, then close.
+            # ---------- CLOSING PHASE ----------
+            # (End) -> (SC,BYE)
             send_packet(s, "End", [])
-            if get_message("BYE"):
-                print("Goodbye.")
+            get_message()
+            print("Goodbye.")
             break
 
         else:
             print("Please choose 1, 2, 3 or 4.")
 
-except (EOFError, KeyboardInterrupt):
-    print("\nClient stopped.")
+except ConnectionRefusedError:
+    print("Could not connect. Is the server running?")
+except (EOFError, ConnectionError):
+    print("Connection to the server was lost.")
 except Exception as error:
     print("Error:", error)
 finally:
