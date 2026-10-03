@@ -133,12 +133,126 @@ int receive_packet(
 }
 
 
+/*
+Base64 alphabet. Every group of 3 bytes becomes 4 of these characters.
+*/
+char base64_chars[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+
+/*
+Encode length bytes from input into Base64 text in output.
+Example: "data.txt" becomes "ZGF0YS50eHQ="
+*/
+void base64_encode(char *input, int length, char *output) {
+    int i = 0;
+    int j = 0;
+
+    while (i < length) {
+        /* Take up to 3 bytes (missing bytes count as 0) */
+        unsigned char b1 = input[i];
+        unsigned char b2 = 0;
+        unsigned char b3 = 0;
+
+        if (i + 1 < length) {
+            b2 = input[i + 1];
+        }
+        if (i + 2 < length) {
+            b3 = input[i + 2];
+        }
+
+        /* Split the 24 bits into four 6-bit numbers */
+        output[j] = base64_chars[b1 >> 2];
+        output[j + 1] = base64_chars[((b1 & 3) << 4) | (b2 >> 4)];
+        output[j + 2] = base64_chars[((b2 & 15) << 2) | (b3 >> 6)];
+        output[j + 3] = base64_chars[b3 & 63];
+
+        /* Use '=' as padding when the last group was not complete */
+        if (i + 1 >= length) {
+            output[j + 2] = '=';
+        }
+        if (i + 2 >= length) {
+            output[j + 3] = '=';
+        }
+
+        i = i + 3;
+        j = j + 4;
+    }
+
+    output[j] = '\0';
+}
+
+
+/*
+Return the 6-bit value of one Base64 character (0 to 63).
+*/
+int base64_value(char c) {
+    int i;
+
+    for (i = 0; i < 64; i++) {
+        if (base64_chars[i] == c) {
+            return i;
+        }
+    }
+
+    /* '=' padding (or any other character) counts as 0 */
+    return 0;
+}
+
+
+/*
+Decode Base64 text from input into output.
+Returns the number of decoded bytes.
+*/
+int base64_decode(char *input, char *output) {
+    int length = strlen(input);
+    int i = 0;
+    int j = 0;
+
+    while (i + 3 < length) {
+        /* Four characters hold 24 bits = 3 bytes */
+        int v1 = base64_value(input[i]);
+        int v2 = base64_value(input[i + 1]);
+        int v3 = base64_value(input[i + 2]);
+        int v4 = base64_value(input[i + 3]);
+
+        output[j] = (v1 << 2) | (v2 >> 4);
+        j = j + 1;
+
+        /* '=' means there is no second or third byte */
+        if (input[i + 2] != '=') {
+            output[j] = ((v2 & 15) << 4) | (v3 >> 2);
+            j = j + 1;
+        }
+        if (input[i + 3] != '=') {
+            output[j] = ((v3 & 3) << 6) | v4;
+            j = j + 1;
+        }
+
+        i = i + 4;
+    }
+
+    output[j] = '\0';
+    return j;
+}
+
+
+/*
+Size of the receive buffers. A file must be smaller than this.
+*/
+#define BUFFER_SIZE 100000
+
+
 int main() {
     int socket_fd;
     int port = 5050;
 
     char server_ip[16];
-    char response[1000];
+    char response[BUFFER_SIZE];
+    char file_data[BUFFER_SIZE];
+    char filename[256];
+    char encoded_name[400];
+    char request[500];
 
     printf("Enter the server address: ");
     scanf("%15s", server_ip);
@@ -202,7 +316,7 @@ int main() {
     printf("Sent: (SS,RFMP,v1.0,0)\n");
 
     /* Receive the server's connection confirmation */
-    if (!receive_packet(socket_fd, response, 1000)) {
+    if (!receive_packet(socket_fd, response, BUFFER_SIZE)) {
         printf("Could not receive the server response.\n");
         close(socket_fd);
         return 1;
@@ -218,6 +332,58 @@ int main() {
 
     printf("Handshake completed successfully.\n");
 
+    /* ---------- OPERATION PHASE: openRead ---------- */
+
+    printf("Enter the file name to read from the server: ");
+    scanf("%255s", filename);
+
+    /* The filename is sent in Base64: (CM,openRead,<base64 name>) */
+    base64_encode(filename, strlen(filename), encoded_name);
+
+    strcpy(request, "(CM,openRead,");
+    strcat(request, encoded_name);
+    strcat(request, ")");
+
+    if (!send_packet(socket_fd, request)) {
+        printf("Could not send the openRead packet.\n");
+        close(socket_fd);
+        return 1;
+    }
+
+    printf("Sent: %s\n", request);
+
+    /* The reply is (DP,<base64 data>) or (EE,code,<base64 description>) */
+    if (!receive_packet(socket_fd, response, BUFFER_SIZE)) {
+        printf("Could not receive the file (it may be too large).\n");
+        close(socket_fd);
+        return 1;
+    }
+
+    /* Remove the closing ')' so only the Base64 text is left */
+    response[strlen(response) - 1] = '\0';
+
+    if (strncmp(response, "(DP,", 4) == 0) {
+        /* response + 4 points to the text after "(DP," */
+        base64_decode(response + 4, file_data);
+
+        printf("----- %s -----\n", filename);
+        printf("%s\n", file_data);
+        printf("-----------------\n");
+
+        /* The server then sends (SC,READ_COMPLETE) */
+        receive_packet(socket_fd, response, BUFFER_SIZE);
+    }
+    else if (strncmp(response, "(EE,", 4) == 0) {
+        /* (EE,2,<base64>): the code is at index 4, the description starts at 6 */
+        base64_decode(response + 6, file_data);
+        printf("Server error %c: %s\n", response[4], file_data);
+    }
+    else {
+        printf("Unexpected reply: %s\n", response);
+    }
+
+    /* ---------- CLOSING PHASE ---------- */
+
     /* Ask the server to close the connection */
     if (!send_packet(socket_fd, "(End)")) {
         printf("Could not send the End packet.\n");
@@ -228,7 +394,7 @@ int main() {
     printf("Sent: (End)\n");
 
     /* Receive the closing acknowledgement */
-    if (!receive_packet(socket_fd, response, 1000)) {
+    if (!receive_packet(socket_fd, response, BUFFER_SIZE)) {
         printf("Could not receive the closing response.\n");
         close(socket_fd);
         return 1;
