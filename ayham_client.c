@@ -266,25 +266,29 @@ int main() {
     }
 
     /*
-    sockaddr_in stores the server's IPv4 address and port.
-    This structure is supplied by the socket library.
+    The server address is 16 bytes in this layout (Linux):
+      bytes 0-1  : address family (AF_INET = IPv4)
+      bytes 2-3  : port number in network byte order
+      bytes 4-7  : IPv4 address
+      bytes 8-15 : unused (zeros)
+    We fill a plain char array using pointers.
     */
-    struct sockaddr_in server_address = {0};
+    char server_address[16];
+    memset(server_address, 0, 16);
 
-    server_address.sin_family = AF_INET;
-    server_address.sin_port = htons(port);
+    /* bytes 0-1: address family */
+    unsigned short *family = (unsigned short *)server_address;
+    *family = AF_INET;
+
+    /* bytes 2-3: port, converted to network byte order */
+    unsigned short *port_number = (unsigned short *)(server_address + 2);
+    *port_number = htons(port);
 
     /*
-    Convert an address such as 127.0.0.1 into the form
-    required by the socket library.
+    bytes 4-7: convert an address such as 127.0.0.1
+    into 4 bytes and store them at server_address + 4
     */
-    if (
-        inet_pton(
-            AF_INET,
-            server_ip,
-            &server_address.sin_addr
-        ) != 1
-    ) {
+    if (inet_pton(AF_INET, server_ip, server_address + 4) != 1) {
         printf("Invalid server address.\n");
         close(socket_fd);
         return 1;
@@ -295,8 +299,8 @@ int main() {
     if (
         connect(
             socket_fd,
-            (struct sockaddr *)&server_address,
-            sizeof(server_address)
+            (void *)server_address,
+            16
         ) < 0
     ) {
         printf("Could not connect to the server.\n");
